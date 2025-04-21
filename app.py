@@ -1,28 +1,66 @@
-import gradio as gr
+import streamlit as st
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
+import torch.hub
 import re
-model1_path = "modernbert.bin"
-model2_path = "https://huggingface.co/mihalykiss/modernbert_2/resolve/main/Model_groups_3class_seed12"
-model3_path = "https://huggingface.co/mihalykiss/modernbert_2/resolve/main/Model_groups_3class_seed22"
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+import os
 
-tokenizer = AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base")
+# --- Configuration ---
+MODEL1_PATH = "modernbert.bin" # Make sure this file is in the same directory or provide the full path
+MODEL2_URL = "https://huggingface.co/mihalykiss/modernbert_2/resolve/main/Model_groups_3class_seed12"
+MODEL3_URL = "https://huggingface.co/mihalykiss/modernbert_2/resolve/main/Model_groups_3class_seed22"
+BASE_MODEL = "answerdotai/ModernBERT-base"
+NUM_LABELS = 41
 
-model_1 = AutoModelForSequenceClassification.from_pretrained("answerdotai/ModernBERT-base", num_labels=41)
-model_1.load_state_dict(torch.load(model1_path, map_location=device))
-model_1.to(device).eval()
+# --- Device Setup ---
+@st.cache_resource
+def get_device():
+    """Gets the appropriate torch device."""
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-model_2 = AutoModelForSequenceClassification.from_pretrained("answerdotai/ModernBERT-base", num_labels=41)
-model_2.load_state_dict(torch.hub.load_state_dict_from_url(model2_path, map_location=device))
-model_2.to(device).eval()
+DEVICE = get_device()
 
-model_3 = AutoModelForSequenceClassification.from_pretrained("answerdotai/ModernBERT-base", num_labels=41)
-model_3.load_state_dict(torch.hub.load_state_dict_from_url(model3_path, map_location=device))
-model_3.to(device).eval()
+# --- Model and Tokenizer Loading (Cached) ---
+@st.cache_resource
+def load_tokenizer(model_name):
+    """Loads the tokenizer."""
+    st.info(f"Loading tokenizer: {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    st.info("Tokenizer loaded.")
+    return tokenizer
+
+@st.cache_resource
+def load_model(model_path_or_url, base_model, num_labels, is_url=False, _device=DEVICE):
+    """Loads a sequence classification model from local path or URL."""
+    model_name = os.path.basename(model_path_or_url) if not is_url else model_path_or_url.split('/')[-1]
+    st.info(f"Loading model structure: {base_model}...")
+    model = AutoModelForSequenceClassification.from_pretrained(base_model, num_labels=num_labels)
+    st.info(f"Loading model weights: {model_name}...")
+    try:
+        if is_url:
+            state_dict = torch.hub.load_state_dict_from_url(model_path_or_url, map_location=_device, progress=True)
+        else:
+            if not os.path.exists(model_path_or_url):
+                 st.error(f"Model file not found at {model_path_or_url}. Please ensure it's in the correct location.")
+                 st.stop() # Stop execution if local model is missing
+            state_dict = torch.load(model_path_or_url, map_location=_device)
+        model.load_state_dict(state_dict)
+        model.to(_device).eval()
+        st.info(f"Model {model_name} loaded and moved to {_device}.")
+        return model
+    except Exception as e:
+        st.error(f"Error loading model {model_name}: {e}")
+        st.stop() # Stop execution on model loading error
 
 
-label_mapping = {
+TOKENIZER = load_tokenizer(BASE_MODEL)
+MODEL_1 = load_model(MODEL1_PATH, BASE_MODEL, NUM_LABELS, is_url=False, _device=DEVICE)
+MODEL_2 = load_model(MODEL2_URL, BASE_MODEL, NUM_LABELS, is_url=True, _device=DEVICE)
+MODEL_3 = load_model(MODEL3_URL, BASE_MODEL, NUM_LABELS, is_url=True, _device=DEVICE)
+
+
+# --- Label Mapping ---
+LABEL_MAPPING = {
     0: '13B', 1: '30B', 2: '65B', 3: '7B', 4: 'GLM130B', 5: 'bloom_7b',
     6: 'bloomz', 7: 'cohere', 8: 'davinci', 9: 'dolly', 10: 'dolly-v2-12b',
     11: 'flan_t5_base', 12: 'flan_t5_large', 13: 'flan_t5_small',
@@ -34,190 +72,191 @@ label_mapping = {
     35: 'opt_iml_30b', 36: 'opt_iml_max_1.3b', 37: 't0_11b', 38: 't0_3b',
     39: 'text-davinci-002', 40: 'text-davinci-003'
 }
+HUMAN_LABEL_INDEX = 24 # Assuming 'human' is always index 24
 
+# --- Text Processing Functions ---
 def clean_text(text):
-
+    """Cleans the input text using regex."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    
- 
-    text = re.sub(r"\n\s*\n+", "\n\n", text)  
-    
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
     text = re.sub(r"[ \t]+", " ", text)
-
-    text = re.sub(r"(\w+)-\n(\w+)", r"\1\2", text)  
-
-    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)  
-
+    text = re.sub(r"(\w+)-\n(\w+)", r"\1\2", text) # Handle hyphenated words broken by newline
+    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text) # Replace single newlines with spaces
     text = text.strip()
-    
     return text
 
-def classify_text(text):
-    cleaned_text = clean_text(text)
-    if not text.strip():
-        result_message = (
-            f"---- \n"
-        )
-        return result_message
+def classify_text(text, tokenizer, model_1, model_2, model_3, device, label_mapping, human_label_index):
+    """Classifies the text using the ensemble of models."""
+    if not text or not text.strip():
+        return None # Indicate no classification needed for empty text
 
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True).to(device)
+    cleaned_text = clean_text(text)
+    inputs = tokenizer(cleaned_text, return_tensors="pt", truncation=True, padding=True, max_length=tokenizer.model_max_length).to(device)
 
     with torch.no_grad():
-        logits_1 = model_1(**inputs).logits
-        logits_2 = model_2(**inputs).logits
-        logits_3 = model_3(**inputs).logits
+        try:
+            logits_1 = model_1(**inputs).logits
+            logits_2 = model_2(**inputs).logits
+            logits_3 = model_3(**inputs).logits
 
-        softmax_1 = torch.softmax(logits_1, dim=1)
-        softmax_2 = torch.softmax(logits_2, dim=1)
-        softmax_3 = torch.softmax(logits_3, dim=1)
+            softmax_1 = torch.softmax(logits_1, dim=1)
+            softmax_2 = torch.softmax(logits_2, dim=1)
+            softmax_3 = torch.softmax(logits_3, dim=1)
 
-        averaged_probabilities = (softmax_1 + softmax_2 + softmax_3) / 3
-        probabilities = averaged_probabilities[0]
+            # Ensemble by averaging probabilities
+            averaged_probabilities = (softmax_1 + softmax_2 + softmax_3) / 3
+            probabilities = averaged_probabilities[0].cpu() # Move to CPU for numpy/python processing
 
-    ai_probs = probabilities.clone()
-    ai_probs[24] = 0
-    ai_total_prob = ai_probs.sum().item() * 100
-    human_prob = 100 - ai_total_prob
+            # Separate human vs AI probability
+            human_prob = probabilities[human_label_index].item() * 100
 
-    ai_argmax_index = torch.argmax(ai_probs).item()
-    ai_argmax_model = label_mapping[ai_argmax_index]
+            # Calculate AI probability (sum of all non-human labels)
+            ai_probs = probabilities.clone()
+            ai_probs[human_label_index] = 0 # Zero out human probability for AI calculation
+            ai_total_prob = ai_probs.sum().item() * 100
 
-    if human_prob > ai_total_prob:
-        result_message = (
-            f"**The text is** <span class='highlight-human'>**{human_prob:.2f}%** likely <b>Human written</b>.</span>"
-        )
-    else:
-        result_message = (
-            f"**The text is** <span class='highlight-ai'>**{ai_total_prob:.2f}%** likely <b>AI generated</b>.</span>\n\n"
-            f"**Identified AI Model: {ai_argmax_model}**"
-        )
+            # Find the most likely AI model
+            ai_argmax_index = torch.argmax(ai_probs).item()
+            ai_argmax_model = label_mapping.get(ai_argmax_index, "Unknown AI")
 
-    return result_message
-
-
-
-
-
-title = "AI Text Detector"
-
-description = """"""
-bottom_text = "**Developed by Eeman Majumder**"
+            # Determine final classification
+            if human_prob > ai_total_prob:
+                return {"is_human": True, "probability": human_prob, "model": "Human"}
+            else:
+                return {"is_human": False, "probability": ai_total_prob, "model": ai_argmax_model}
+        except Exception as e:
+             st.error(f"Error during model inference: {e}")
+             return {"error": True}
 
 
-# AI_texts = [
-# "Camels are remarkable desert animals known for their unique adaptations to harsh, arid environments. Native to the Middle East, North Africa, and parts of Asia, camels have been essential to human life for centuries, serving as a mode of transportation, a source of food, and even a symbol of endurance and survival. There are two primary species of camels: the dromedary camel, which has a single hump and is commonly found in the Middle East and North Africa, and the Bactrian camel, which has two humps and is native to Central Asia. Their humps store fat, not water, as commonly believed, allowing them to survive long periods without food by metabolizing the stored fat for energy. Camels are highly adapted to desert life. They can go for weeks without water, and when they do drink, they can consume up to 40 gallons in one sitting. Their thick eyelashes, sealable nostrils, and wide, padded feet protect them from sand and help them walk easily on loose desert terrain.",
-# "Wines are a fascinating reflection of culture, history, and craftsmanship. They embody a rich diversity shaped by the land, climate, and traditions where they are produced. From the bold reds of Bordeaux to the crisp whites of New Zealand, each bottle tells a unique story. What makes wine so special is its ability to connect people. Whether shared at a family dinner, a celebratory event, or a quiet evening with friends, wine enhances experiences and brings people together. The variety of flavors and aromas, influenced by grape type, fermentation techniques, and aging processes, make wine tasting a complex yet rewarding journey for the senses.",
-# "I find artificial intelligence (AI) to be one of the most transformative and fascinating technologies of our time. Its potential spans a wide range of applications, from automating mundane tasks to revolutionizing industries like healthcare, education, and entertainment. AI has already made significant contributions in fields like language processing, image recognition, and decision-making systems, enabling innovations that were once purely science fiction. However, as powerful as AI can be, it also brings challenges and responsibilities. Ethical considerations, such as bias in data, transparency, and the potential for misuse, need to be carefully addressed to ensure fairness and accountability. The rise of generative AI has also sparked debates about creativity, originality, and intellectual property, making it essential to strike a balance between technological advancement and respecting human contributions."
-# ]
+# --- Streamlit UI ---
+st.set_page_config(page_title="AI Text Detector", layout="centered")
 
-# Human_texts = [
-# "The present book is intended as a text in basic mathematics. As such, it can have multiple use: for a one-year course in the high schools during the third or fourth year (if possible the third, so that calculus can be taken during the fourth year); for a complementary reference in earlier high school grades (elementary algebra and geometry are covered); for a one-semester course at the college level, to review or to get a firm foundation in the basic mathematics necessary to go ahead in calculus, linear algebra, or other topics. Years ago, the colleges used to give courses in “ college algebra” and other subjects which should have been covered in high school. More recently, such courses have been thought unnecessary, but some experiences I have had show that they are just as necessary as ever. What is happening is that thecolleges are getting a wide variety of students from high schools, ranging from exceedingly well-prepared ones who have had a good first course in calculus, down to very poorly prepared ones.",
-# "Fats are rich in energy, build body cells, support brain development of infants, help body processes, and facilitate the absorption and use of fat-soluble vitamins A, D, E, and K. The major component of lipids is glycerol and fatty acids. According to chemical properties, fatty acids can be divided into saturated and unsaturated fatty acids. Generally lipids containing saturated fatty acids are solid at room temperature and include animal fats (butter, lard, tallow, ghee) and tropical oils (palm,coconut, palm kernel). Saturated fats increase the risk of heart disease.",
-# "To make BERT handle a variety of down-stream tasks, our input representation is able to unambiguously represent both a single sentence and a pair of sentences (e.g., h Question, Answeri) in one token sequence. Throughout this work, a “sentence” can be an arbitrary span of contiguous text, rather than an actual linguistic sentence. A “sequence” refers to the input token sequence to BERT, which may be a single sentence or two sentences packed together. We use WordPiece embeddings (Wu et al., 2016) with a 30,000 token vocabulary. The first token of every sequence is always a special classification token ([CLS]). The final hidden state corresponding to this token is used as the aggregate sequence representation for classification tasks. Sentence pairs are packed together into a single sequence."]
-iface = gr.Blocks(css="""
+# Inject Custom CSS for highlighting
+st.markdown("""
+<style>
     @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;700&display=swap');
 
-    #text_input_box {
-        border-radius: 10px;
-        border: 2px solid #4CAF50;
-        font-size: 18px;
-        padding: 15px;
-        margin-bottom: 20px;
-        width: 60%;
-        box-sizing: border-box;
-        margin: auto;
-    }
-    .form.svelte-633qhp {
-        background: none;
-        border: none;
-        box-shadow: none;
-    }
-
-    #result_output_box {
-        border-radius: 10px;
-        border: 2px solid #4CAF50;
-        font-size: 18px;
-        padding: 15px;
-        margin-top: 20px;
-        width: 40%;
-        box-sizing: border-box;
-        text-align: center;
-        margin: auto;
-    }
-
-    @media (max-width: 768px) {
-        #result_output_box {
-            width: 100%;
-        }
-	#text_input_box{
-	    width: 100%;
-	}
-    }
-
-    body {
+    body, .stTextArea textarea, .stMarkdown, .stButton button {
         font-family: 'Roboto Mono', sans-serif !important;
-        padding: 20px;
-        display: block;
-        justify-content: center;
-        align-items: center;
-        height: 100vh;
-        overflow-y: auto;
     }
-
-    .gradio-container {
-        border: 1px solid #4CAF50;
-        border-radius: 15px;
-        padding: 30px;
-        box-shadow: 0px 0px 10px rgba(0,255,0,0.6);
-        max-width: 600px;
-        margin: auto;
-	overflow-y: auto;
+    .stTextArea textarea {
+        border: 2px solid #4CAF50;
+        border-radius: 10px;
+        font-size: 16px; /* Adjusted for better fit */
+        padding: 15px;
+        background-color: #f0fff0; /* Light green background */
     }
-
-    h1 {
-        text-align: center;
-        font-size: 32px;
+     .stButton button {
+        border-radius: 10px;
+        border: 2px solid #4CAF50;
+        padding: 10px 24px;
+        width: 100%;
         font-weight: bold;
-        margin-bottom: 30px;
+        background-color: #4CAF50;
+        color: white;
+     }
+     .stButton button:hover {
+        background-color: #45a049;
+        color: white;
+        border-color: #45a049;
+     }
+
+    .result-box {
+        border-radius: 10px;
+        border: 2px solid #4CAF50;
+        font-size: 18px;
+        padding: 20px;
+        margin-top: 20px;
+        text-align: center;
+        background-color: #f9f9f9;
+        box-shadow: 0px 0px 5px rgba(0,0,0,0.1);
     }
 
     .highlight-human {
-        color: #4CAF50;
+        color: #4CAF50 !important; /* Use !important to override potential conflicts */
         font-weight: bold;
         background: rgba(76, 175, 80, 0.2);
-        padding: 5px;
+        padding: 5px 8px; /* Added padding */
         border-radius: 8px;
+        display: inline-block; /* Ensures padding and background apply correctly */
     }
 
     .highlight-ai {
-        color: #FF5733;
+        color: #FF5733 !important; /* Use !important */
         font-weight: bold;
         background: rgba(255, 87, 51, 0.2);
-        padding: 5px;
+        padding: 5px 8px; /* Added padding */
         border-radius: 8px;
+        display: inline-block; /* Ensures padding and background apply correctly */
     }
-    #bottom_text {
+
+    .footer {
         text-align: center;
         margin-top: 50px;
         font-weight: bold;
-        font-size: 20px;
+        font-size: 16px; /* Adjusted size */
+        color: #555; /* Slightly muted color */
     }
-    .block.svelte-11xb1hd{
-	background: none !important;
-    }
-""")
+</style>
+""", unsafe_allow_html=True)
 
-with iface:
-    gr.Markdown(f"# {title}")
-    gr.Markdown(description)
-    text_input = gr.Textbox(label="", placeholder="Type or paste your content here...", elem_id="text_input_box", lines=5)
-    result_output = gr.Markdown("", elem_id="result_output_box")
-    text_input.change(classify_text, inputs=text_input, outputs=result_output)
-    # with gr.Tab("AI text examples"):
-    #     gr.Examples(AI_texts, inputs=text_input)
-    # with gr.Tab("Human text examples"):
-    #     gr.Examples(Human_texts, inputs=text_input)
-    gr.Markdown(bottom_text, elem_id="bottom_text")
+st.title("🕵️ AI Text Detector 🤖")
+# st.markdown(description) # Add description if you have one
 
-iface.launch(share=True)
+# --- Input Area ---
+input_text = st.text_area(
+    label="Enter text to analyze:",
+    placeholder="Type or paste your content here...",
+    height=200,
+    key="text_input"
+)
 
+# --- Analyze Button and Output ---
+analyze_button = st.button("Analyze Text", key="analyze_button")
+result_placeholder = st.empty() # Create a placeholder for the result output
+
+if analyze_button:
+    if input_text and input_text.strip():
+        with st.spinner('Analyzing text... This might take a moment.'):
+            # --- Perform Classification ---
+            classification_result = classify_text(
+                input_text,
+                TOKENIZER,
+                MODEL_1,
+                MODEL_2,
+                MODEL_3,
+                DEVICE,
+                LABEL_MAPPING,
+                HUMAN_LABEL_INDEX
+            )
+
+        # --- Display Result ---
+        if classification_result and not classification_result.get("error"):
+            if classification_result["is_human"]:
+                prob = classification_result['probability']
+                result_html = (
+                    f"<div class='result-box'>"
+                    f"<b>The text is</b> <span class='highlight-human'><b>{prob:.2f}%</b> likely <b>Human written</b>.</span>"
+                    f"</div>"
+                )
+            else:
+                prob = classification_result['probability']
+                model_name = classification_result['model']
+                result_html = (
+                    f"<div class='result-box'>"
+                    f"<b>The text is</b> <span class='highlight-ai'><b>{prob:.2f}%</b> likely <b>AI generated</b>.</span><br><br>"
+                    f"<b>Identified AI Model: {model_name}</b>"
+                    f"</div>"
+                )
+            result_placeholder.markdown(result_html, unsafe_allow_html=True)
+        elif classification_result and classification_result.get("error"):
+             result_placeholder.error("An error occurred during analysis. Please try again.")
+        else:
+             result_placeholder.warning("Please enter some text to analyze.") # Should not happen if button clicked with text, but good practice
+
+    else:
+        result_placeholder.warning("Please enter some text to analyze.")
+
+# --- Footer ---
+st.markdown("<div class='footer'>**Developed by Eeman Majumder**</div>", unsafe_allow_html=True)
