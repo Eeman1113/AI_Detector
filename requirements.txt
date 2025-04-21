@@ -1,3 +1,10 @@
 gradio
 torch
 git+https://github.com/huggingface/transformers
+streamlit
+transformers
+torch
+sentencepiece
+huggingface-hub
+regex
+accelerate
